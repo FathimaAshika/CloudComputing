@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: game-2048
+  name: deployment-2048-green
+spec:
+  replicas: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # ← ensures 100% uptime during rollout
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: app-2048
+      version: green
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: app-2048
+        version: green
+    spec:
+      containers:
+      - name: app-2048
+        image: public.ecr.aws/d6b9v4a5/plot-listing:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80

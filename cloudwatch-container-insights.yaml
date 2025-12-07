@@ -1,0 +1,221 @@
+# ---------------------------------------------------------
+# Namespace
+# ---------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: amazon-cloudwatch
+
+---
+# ---------------------------------------------------------
+# Service Account for CloudWatch Agent
+# ---------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cloudwatch-agent
+  namespace: amazon-cloudwatch
+  labels:
+    k8s-app: cloudwatch-agent
+
+---
+# ---------------------------------------------------------
+# Service Account for Fluent Bit
+# ---------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: amazon-cloudwatch
+  labels:
+    k8s-app: fluent-bit
+
+---
+# ---------------------------------------------------------
+# ConfigMap: CloudWatch Agent Configuration
+# ---------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudwatch-agent-config
+  namespace: amazon-cloudwatch
+data:
+  cwagentconfig.json: |
+    {
+      "agent": {
+        "metrics_collection_interval": 60,
+        "run_as_user": "0"
+      },
+      "metrics": {
+        "metrics_collected": {
+          "cpu": {
+            "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+            "metrics_collection_interval": 60
+          },
+          "mem": {
+            "measurement": ["mem_used_percent"],
+            "metrics_collection_interval": 60
+          },
+          "disk": {
+            "measurement": ["disk_used_percent"],
+            "metrics_collection_interval": 60
+          },
+          "netstat": {
+            "metrics_collection_interval": 60
+          },
+          "statsd": {
+            "metrics_aggregation_interval": 60,
+            "metrics_collection_interval": 60
+          }
+        }
+      }
+    }
+
+---
+# ---------------------------------------------------------
+# CloudWatch Agent DaemonSet
+# ---------------------------------------------------------
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cloudwatch-agent
+  namespace: amazon-cloudwatch
+  labels:
+    k8s-app: cloudwatch-agent
+spec:
+  selector:
+    matchLabels:
+      k8s-app: cloudwatch-agent
+  template:
+    metadata:
+      labels:
+        k8s-app: cloudwatch-agent
+    spec:
+      serviceAccountName: cloudwatch-agent
+      hostNetwork: true
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cloudwatch-agent
+          image: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest
+          resources:
+            limits:
+              cpu: "200m"
+              memory: "200Mi"
+            requests:
+              cpu: "100m"
+              memory: "100Mi"
+          env:
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: HOST_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/cwagentconfig
+            - name: rootfs
+              mountPath: /rootfs
+              readOnly: true
+      volumes:
+        - name: config-volume
+          configMap:
+            name: cloudwatch-agent-config
+        - name: rootfs
+          hostPath:
+            path: /
+
+---
+# ---------------------------------------------------------
+# Fluent Bit ConfigMap for Logs
+# ---------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: amazon-cloudwatch
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         5
+        Log_Level     info
+        Daemon        off
+
+    [INPUT]
+        Name tail
+        Path /var/log/containers/*.log
+        Tag kube.*
+        Docker_Mode On
+        Mem_Buf_Limit 5MB
+        Skip_Long_Lines On
+
+    [PARSER]
+        Name docker
+        Format json
+        Time_Key time
+        Time_Format %Y-%m-%dT%H:%M:%S
+        Time_Keep On
+
+    [OUTPUT]
+        Name cloudwatch_logs
+        Match kube.*
+        region ${AWS_REGION}
+        log_group_name /eks/cluster-logs
+        log_stream_prefix from-fluent-bit-
+        auto_create_group true
+
+---
+# ---------------------------------------------------------
+# Fluent Bit DaemonSet
+# ---------------------------------------------------------
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: amazon-cloudwatch
+  labels:
+    k8s-app: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      k8s-app: fluent-bit
+  template:
+    metadata:
+      labels:
+        k8s-app: fluent-bit
+    spec:
+      serviceAccountName: fluent-bit
+      containers:
+        - name: fluent-bit
+          image: public.ecr.aws/aws-observability/aws-for-fluent-bit:latest
+          resources:
+            limits:
+              cpu: 200m
+              memory: 200Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+            - name: dockerlog
+              mountPath: /var/lib/docker/containers
+            - name: config
+              mountPath: /fluent-bit/etc
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: dockerlog
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: config
+          configMap:
+            name: fluent-bit-config

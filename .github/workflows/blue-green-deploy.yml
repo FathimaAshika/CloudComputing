@@ -1,0 +1,178 @@
+name: Plot Listing Blue-Green CI/CD
+
+on:
+  push:
+    branches: ["main"]        # deploy on every push to main
+  schedule:
+    - cron: "0 1 * * *"       # run integration tests daily at 01:00 UTC
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  PUBLIC_ECR_URI: public.ecr.aws/d6b9v4a5/plot-listing
+  EKS_CLUSTER: demo-cluster-1
+  K8S_NAMESPACE: game-2048
+  GREEN_DEPLOYMENT: deployment-2048-green
+  BLUE_DEPLOYMENT: deployment-2048-blue
+  SERVICE_NAME: service-2048
+  # Set this in the YAML or better as a repo var/secret:
+  PROD_BASE_URL: http://k8s-game2048-ingress2-e1d9d1f206-282149388.us-east-1.elb.amazonaws.com/
+jobs:
+  # ---------------------------------------------------
+  # 1) BUILD & PUSH IMAGE (runs on push to main)
+  # ---------------------------------------------------
+  build-and-push:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon Public ECR
+        run: |
+          aws ecr-public get-login-password --region $AWS_REGION \
+          | docker login --username AWS --password-stdin public.ecr.aws
+
+      - name: Build Docker image
+        run: |
+          docker build -t plot-listing .
+
+      - name: Tag image
+        run: |
+          docker tag plot-listing:latest $PUBLIC_ECR_URI:green-${{ github.sha }}
+          docker tag plot-listing:latest $PUBLIC_ECR_URI:latest
+
+      - name: Push image to ECR
+        run: |
+          docker push $PUBLIC_ECR_URI:green-${{ github.sha }}
+          docker push $PUBLIC_ECR_URI:latest
+
+  # ---------------------------------------------------
+  # 2) DEPLOY TO GREEN USING ROLLING UPDATE + PRE-SWITCH TESTS
+  # ---------------------------------------------------
+  deploy-green:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+
+      - name: Update GREEN deployment image (RollingUpdate inside green)
+        run: |
+          kubectl -n $K8S_NAMESPACE set image deployment/$GREEN_DEPLOYMENT \
+            app-2048=$PUBLIC_ECR_URI:green-${{ github.sha }} --record
+
+      - name: Wait for GREEN rollout complete
+        run: |
+          kubectl -n $K8S_NAMESPACE rollout status deployment/$GREEN_DEPLOYMENT --timeout=180s
+
+      # Simple pre-switch smoke test: check at least one green pod is Ready
+      - name: Pre-switch smoke check on GREEN
+        run: |
+          READY=$(kubectl get pods -n $K8S_NAMESPACE \
+            -l app.kubernetes.io/name=app-2048,version=green \
+            -o jsonpath='{.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}')
+          echo "Ready green pods: $READY"
+          if [ -z "$READY" ]; then
+            echo "No ready green pods found. Failing deployment."
+            exit 1
+          fi
+
+  # ---------------------------------------------------
+  # 3) SWITCH TRAFFIC BLUE → GREEN + POST-DEPLOY INTEGRATION TESTS
+  # ---------------------------------------------------
+  switch-and-test:
+    runs-on: ubuntu-latest
+    needs: deploy-green
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+
+      - name: Switch Service selector to GREEN
+        run: |
+          kubectl -n $K8S_NAMESPACE patch service $SERVICE_NAME \
+            -p '{"spec": {"selector": {"app.kubernetes.io/name": "app-2048", "version": "green"}}}'
+
+      - name: Run integration tests against production ALB
+        run: |
+          echo "Running integration tests against $PROD_BASE_URL ..."
+          # Example: simple health check + one page check (you can replace with proper test suite)
+          curl -f "$PROD_BASE_URL/health" || exit 1
+          curl -f "$PROD_BASE_URL/"       || exit 1
+          echo "Integration tests passed."
+
+  # ---------------------------------------------------
+  # 4) ROLLBACK JOB IF SWITCH-AND-TEST FAILS
+  # ---------------------------------------------------
+  rollback:
+    runs-on: ubuntu-latest
+    needs: switch-and-test
+    if: failure() && github.event_name == 'push'
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+
+      - name: Rollback Service to BLUE
+        run: |
+          kubectl -n $K8S_NAMESPACE patch service $SERVICE_NAME \
+            -p '{"spec": {"selector": {"app.kubernetes.io/name": "app-2048", "version": "blue"}}}'
+          echo "Rolled back traffic to BLUE."
+
+  # ---------------------------------------------------
+  # 5) PERIODIC INTEGRATION TESTS (DAILY) AGAINST CURRENT PROD
+  # ---------------------------------------------------
+  periodic-tests:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Periodic integration test run
+        run: |
+          echo "Running periodic integration tests against $PROD_BASE_URL ..."
+          curl -f "$PROD_BASE_URL/health" || exit 1
+          curl -f "$PROD_BASE_URL/"       || exit 1
+          echo "Periodic integration tests passed."
